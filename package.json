@@ -10,6 +10,19 @@
     "test": "tsx --test",
     "check": "npm run lint && npm run typecheck && npm run test"
   },
+  "files": [
+    "index.ts",
+    "src/**",
+    "skills/**",
+    "types/**",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "openclaw": {
     "extensions": [
       "./index.ts"

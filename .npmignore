@@ -1,0 +1,9 @@
+node_modules
+.DS_Store
+.env
+.env.*
+.github
+tests
+eslint.config.js
+tsconfig.json
+package-lock.json
