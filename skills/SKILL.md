@@ -63,6 +63,46 @@ tmux send-keys -t <session:window.pane> C-l
 tmux capture-pane -p -J -t <session:window.pane> -S -200
 ```
 
+## Screenshot tools (priority + install)
+
+Priority detection order:
+
+1. System-level PATH (`command -v cryosnap` / `command -v freeze`)
+2. User-level bins (`~/.local/bin`, `~/bin`)
+3. OpenClaw tools dir (`$OPENCLAW_STATE_DIR/tools`, default `~/.openclaw/tools`)
+
+If cryosnap exists, use it. If not, use freeze. If neither exists, **auto-install cryosnap**.
+
+Install commands (downloads the latest GitHub release into the OpenClaw tools dir):
+
+```bash
+openclaw tmux-watch install cryosnap
+openclaw tmux-watch install freeze
+openclaw tmux-watch update cryosnap
+openclaw tmux-watch update freeze
+openclaw tmux-watch remove cryosnap
+openclaw tmux-watch remove freeze
+```
+
+### cryosnap (preferred)
+
+```bash
+# tmux pane -> PNG
+cryosnap --tmux --tmux-args "-t %3 -S -200 -J" --config full -o out.png
+```
+
+Notes:
+
+- For zsh, wrap `%3` in quotes or escape `%` (e.g., `"-t %3 -S -200 -J"`).
+- You can pass `-t session:window.pane` instead of `%pane_id`.
+
+### freeze (fallback)
+
+```bash
+# Capture ANSI text first, then render with freeze
+tmux capture-pane -p -J -e -t <session:window.pane> -S -200 | freeze -o out.png
+```
+
 ## Tool: tmux-watch
 
 ### Add subscription
