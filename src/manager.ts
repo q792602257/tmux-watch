@@ -2,6 +2,8 @@ import type { OpenClawPluginApi, OpenClawPluginServiceContext } from "openclaw/p
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { captureTmux, type CaptureParams, type CaptureResult } from "./capture.js";
+import { stripAnsi, truncateOutput } from "./text-utils.js";
 import {
   DEFAULT_CAPTURE_INTERVAL_SECONDS,
   DEFAULT_STABLE_COUNT,
@@ -152,6 +154,14 @@ export class TmuxWatchManager {
       });
     }
     return items;
+  }
+
+  async capture(params: CaptureParams): Promise<CaptureResult> {
+    await this.ensureTmuxAvailable();
+    if (!this.tmuxAvailable) {
+      throw new Error("tmux not available");
+    }
+    return captureTmux({ api: this.api, config: this.config, ...params });
   }
 
   async addSubscription(input: Partial<TmuxWatchSubscription> & { target: string }) {
@@ -862,14 +872,6 @@ function hashOutput(output: string): string {
   return createHash("sha256").update(output).digest("hex");
 }
 
-export function stripAnsi(input: string): string {
-  /* eslint-disable no-control-regex */
-  const sgr = new RegExp("\\u001b\\[[0-9;]*m", "g");
-  const osc8 = new RegExp("\\u001b]8;;.*?\\u001b\\\\|\\u001b]8;;\\u001b\\\\", "g");
-  /* eslint-enable no-control-regex */
-  return input.replace(osc8, "").replace(sgr, "");
-}
-
 function parseThreadId(value: unknown): string | number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) {
     return Math.trunc(value);
@@ -887,24 +889,7 @@ function parseThreadId(value: unknown): string | number | undefined {
   return trimmed;
 }
 
-export function truncateOutput(
-  text: string,
-  maxChars: number,
-): { text: string; truncated: boolean } {
-  if (!text) {
-    return { text: "", truncated: false };
-  }
-  if (text.length <= maxChars) {
-    return { text, truncated: false };
-  }
-  let tail = text.slice(-maxChars);
-  const firstNewline = tail.indexOf("\n");
-  if (firstNewline > 0 && firstNewline < tail.length - 1) {
-    tail = tail.slice(firstNewline + 1);
-  }
-  tail = tail.trimStart();
-  return { text: `...[truncated]\n${tail}`, truncated: true };
-}
+export { stripAnsi, truncateOutput };
 
 function dedupeTargets(targets: ResolvedTarget[]): ResolvedTarget[] {
   const seen = new Set<string>();

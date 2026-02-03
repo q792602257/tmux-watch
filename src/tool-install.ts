@@ -151,7 +151,7 @@ export async function removeTool(params: {
   return { tool: spec.id, path: destPath, removed: true };
 }
 
-function resolveToolsDir(api: OpenClawPluginApi): string {
+export function resolveToolsDir(api: OpenClawPluginApi): string {
   const stateDir = resolveStateDir(api);
   return path.join(stateDir, "tools");
 }
@@ -164,7 +164,7 @@ function resolveStateDir(api: OpenClawPluginApi): string {
   return path.join(os.homedir(), ".openclaw");
 }
 
-function resolveBinaryName(base: string): string {
+export function resolveBinaryName(base: string): string {
   if (process.platform === "win32") {
     return `${base}.exe`;
   }

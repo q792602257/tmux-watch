@@ -1,7 +1,7 @@
 import type { NotifyMode, NotifyTarget } from "./config.js";
 import type { TmuxWatchManager, TmuxWatchSubscription } from "./manager.js";
 
-const ACTIONS = ["add", "remove", "list"] as const;
+const ACTIONS = ["add", "remove", "list", "capture"] as const;
 const NOTIFY_MODES = ["last", "targets", "targets+last"] as const;
 
 type ToolParams = {
@@ -18,6 +18,12 @@ type ToolParams = {
   stableSeconds?: number;
   captureLines?: number;
   stripAnsi?: boolean;
+  format?: string;
+  imageFormat?: string;
+  outputPath?: string;
+  base64?: boolean;
+  ttlSeconds?: number;
+  maxChars?: number;
   enabled?: boolean;
   notifyMode?: NotifyMode;
   targets?: NotifyTarget[];
@@ -70,7 +76,7 @@ export function createTmuxWatchTool(manager: TmuxWatchManager) {
   return {
     name: "tmux-watch",
     description:
-      "Manage tmux-watch subscriptions (add/remove/list) that monitor tmux pane output.",
+      "Manage tmux-watch subscriptions (add/remove/list) or capture tmux output.",
     parameters: {
       type: "object",
       additionalProperties: false,
@@ -95,6 +101,15 @@ export function createTmuxWatchTool(manager: TmuxWatchManager) {
         stableSeconds: { type: "number", description: "Legacy: stable duration in seconds." },
         captureLines: { type: "number", description: "Lines to capture." },
         stripAnsi: { type: "boolean", description: "Strip ANSI escape codes." },
+        format: { type: "string", description: "Capture format: text, image, or both." },
+        imageFormat: { type: "string", description: "Image format: png, svg, webp." },
+        outputPath: { type: "string", description: "Image output path (optional)." },
+        base64: { type: "boolean", description: "Include base64 image output." },
+        ttlSeconds: {
+          type: "number",
+          description: "Temporary image TTL in seconds (default 600).",
+        },
+        maxChars: { type: "number", description: "Max characters for text output." },
         enabled: { type: "boolean", description: "Enable or disable subscription." },
         notifyMode: {
           type: "string",
@@ -172,6 +187,27 @@ export function createTmuxWatchTool(manager: TmuxWatchManager) {
               includeOutput: params.includeOutput !== false,
             });
             return jsonResult({ ok: true, subscriptions: items });
+          }
+          case "capture": {
+            const target = readString(params.target);
+            if (!target) {
+              throw new Error("target required for capture action");
+            }
+            const result = await manager.capture({
+              target,
+              socket: readString(params.socket),
+              captureLines:
+                typeof params.captureLines === "number" ? params.captureLines : undefined,
+              stripAnsi: typeof params.stripAnsi === "boolean" ? params.stripAnsi : undefined,
+              format: readString(params.format),
+              imageFormat: readString(params.imageFormat),
+              outputPath: readString(params.outputPath),
+              base64: typeof params.base64 === "boolean" ? params.base64 : undefined,
+              ttlSeconds:
+                typeof params.ttlSeconds === "number" ? params.ttlSeconds : undefined,
+              maxChars: typeof params.maxChars === "number" ? params.maxChars : undefined,
+            });
+            return jsonResult({ ok: true, capture: result });
           }
           default: {
             params.action satisfies never;

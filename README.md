@@ -123,9 +123,49 @@ echo $TMUX
 }
 ```
 
+### 发送输入到 pane
+
+```bash
+openclaw tmux-watch send test-dir:0.0 "your text"
+```
+
+默认行为等同于两步：先 `send-keys -l` 输入文本，再单独 `send-keys C-m` 提交。两步之间默认延迟 `20ms`。
+
+常用选项：
+
+- `--no-enter`：只输入，不回车。
+- `--delay-ms 50`：调整输入与回车之间的延迟。
+- `--socket /path/to/socket`：指定 tmux socket。
+- `--target ... --text ...`：用参数替代位置参数。
+
+### 捕获输出 / 截图
+
+```bash
+# 文本（默认）
+openclaw tmux-watch capture session:0.0
+
+# 图片（临时文件，默认 10 分钟 TTL）
+openclaw tmux-watch capture session:0.0 --format image
+
+# 文本 + 图片（可选 base64）
+openclaw tmux-watch capture session:0.0 --format both --base64
+
+# 指定输出路径（不会自动清理）
+openclaw tmux-watch capture session:0.0 --format image --output /tmp/pane.png
+```
+
+说明：
+
+- 图片优先使用 `cryosnap`，其次使用 `freeze`。若均未安装，请手动安装：
+  - `openclaw tmux-watch install cryosnap`
+  - `openclaw tmux-watch install freeze`
+- 临时图片默认 TTL 为 10 分钟，可用 `--ttl-seconds` 覆盖。
+- 可用 `--image-format png|svg|webp` 指定格式。
+
 ### 依赖
 
 - 系统依赖：`tmux`
+- 可选截图依赖：`cryosnap`（优先）或 `freeze`
 - peer 依赖：`openclaw >= 2026.1.29`
 
 <a id="en"></a>
@@ -250,7 +290,48 @@ openclaw tmux-watch setup --socket "/private/tmp/tmux-501/default"
 }
 ```
 
+### Send input to a pane
+
+```bash
+openclaw tmux-watch send test-dir:0.0 "your text"
+```
+
+Default behavior is two-step: send text with `send-keys -l`, then send `C-m` (Enter) separately.
+The default delay between the two steps is `20ms`.
+
+Common options:
+
+- `--no-enter`: type only, do not press Enter.
+- `--delay-ms 50`: adjust the delay between text and Enter.
+- `--socket /path/to/socket`: specify tmux socket.
+- `--target ... --text ...`: use flags instead of positional args.
+
+### Capture output / snapshot
+
+```bash
+# Text only (default)
+openclaw tmux-watch capture session:0.0
+
+# Image only (temporary file, 10-min TTL)
+openclaw tmux-watch capture session:0.0 --format image
+
+# Both text + image (optional base64)
+openclaw tmux-watch capture session:0.0 --format both --base64
+
+# Persist image to a path (no TTL cleanup)
+openclaw tmux-watch capture session:0.0 --format image --output /tmp/pane.png
+```
+
+Notes:
+
+- Image capture prefers `cryosnap`, then falls back to `freeze`. If neither exists, install one:
+  - `openclaw tmux-watch install cryosnap`
+  - `openclaw tmux-watch install freeze`
+- Temporary images default to a 10-minute TTL; override with `--ttl-seconds`.
+- Use `--image-format png|svg|webp` to select the output format.
+
 ### Requirements
 
 - System dependency: `tmux`
+- Optional image tools: `cryosnap` (preferred) or `freeze`
 - Peer dependency: `openclaw >= 2026.1.29`

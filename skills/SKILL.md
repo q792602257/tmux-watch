@@ -37,9 +37,7 @@ tmux -S /path/to/socket capture-pane -p -J -t <session:window.pane> -S -200
 
 ## Controlling a TUI in tmux (high-signal tips)
 
-- Prefer `send-keys -l` for literal text input to avoid tmux interpreting key names.
-- For TUIs with input boxes (Codex/Claude Code), send text with `-l` first, then send `C-m`
-  as a separate command to submit reliably.
+- Prefer `openclaw tmux-watch send` for reliable input (two-step, default 20ms delay).
 - Use `C-c` to interrupt a stuck process; use `C-m` (Enter) to submit commands.
 - For TUIs, avoid rapid key spam; send a small sequence, then capture output to verify state.
 - Use `capture-pane -p -J -S -200` to get recent context before and after an action.
@@ -48,9 +46,8 @@ tmux -S /path/to/socket capture-pane -p -J -t <session:window.pane> -S -200
 Examples:
 
 ```bash
-# Send a command to the pane (two-step: text then Enter)
-tmux send-keys -t <session:window.pane> -l -- "status"
-tmux send-keys -t <session:window.pane> C-m
+# Send a command via tmux-watch (default delay 20ms + Enter)
+openclaw tmux-watch send <session:window.pane> "status"
 
 # Interrupt a stuck process
 tmux send-keys -t <session:window.pane> C-c
@@ -63,45 +60,44 @@ tmux send-keys -t <session:window.pane> C-l
 tmux capture-pane -p -J -t <session:window.pane> -S -200
 ```
 
-## Screenshot tools (priority + install)
+## Screenshot capture (preferred)
+
+Use `openclaw tmux-watch capture` to capture text/images from a tmux target. The plugin selects
+`cryosnap` first, then falls back to `freeze`.
 
 Priority detection order:
 
-1. System-level PATH (`command -v cryosnap` / `command -v freeze`)
+1. System-level PATH (`cryosnap` / `freeze`)
 2. User-level bins (`~/.local/bin`, `~/bin`)
 3. OpenClaw tools dir (`$OPENCLAW_STATE_DIR/tools`, default `~/.openclaw/tools`)
 
-If cryosnap exists, use it. If not, use freeze. If neither exists, **auto-install cryosnap**.
-
-Install commands (downloads the latest GitHub release into the OpenClaw tools dir):
+If neither tool exists, return an error and ask the user to install one:
 
 ```bash
 openclaw tmux-watch install cryosnap
 openclaw tmux-watch install freeze
-openclaw tmux-watch update cryosnap
-openclaw tmux-watch update freeze
-openclaw tmux-watch remove cryosnap
-openclaw tmux-watch remove freeze
 ```
 
-### cryosnap (preferred)
+Examples:
 
 ```bash
-# tmux pane -> PNG
-cryosnap --tmux --tmux-args "-t %3 -S -200 -J" --config full -o out.png
+# Text only (uses plugin defaults for lines/strip)
+openclaw tmux-watch capture <session:window.pane>
+
+# Image only (temporary file, auto-cleaned after 10 minutes)
+openclaw tmux-watch capture <session:window.pane> --format image
+
+# Both text + image, include base64 (optional)
+openclaw tmux-watch capture <session:window.pane> --format both --base64
+
+# Persist image to a path (no TTL cleanup)
+openclaw tmux-watch capture <session:window.pane> --format image --output /tmp/pane.png
 ```
 
 Notes:
 
-- For zsh, wrap `%3` in quotes or escape `%` (e.g., `"-t %3 -S -200 -J"`).
-- You can pass `-t session:window.pane` instead of `%pane_id`.
-
-### freeze (fallback)
-
-```bash
-# Capture ANSI text first, then render with freeze
-tmux capture-pane -p -J -e -t <session:window.pane> -S -200 | freeze -o out.png
-```
+- Temporary images default to a 10-minute TTL. Override with `--ttl-seconds`.
+- Use `--image-format png|svg|webp` to select output format.
 
 ## Tool: tmux-watch
 
@@ -145,6 +141,20 @@ Optional routing overrides:
 
 ```json
 { "action": "list", "includeOutput": true }
+```
+
+### Capture once
+
+```json
+{
+  "action": "capture",
+  "target": "session:0.0",
+  "format": "both",
+  "captureLines": 200,
+  "stripAnsi": true,
+  "imageFormat": "png",
+  "base64": false
+}
 ```
 
 ## Handling tmux-watch events
