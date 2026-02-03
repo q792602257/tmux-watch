@@ -1,6 +1,6 @@
 {
   "name": "tmux-watch",
-  "version": "2026.2.5",
+  "version": "2026.2.6",
   "type": "module",
   "description": "OpenClaw tmux output watchdog plugin",
   "license": "MIT",
