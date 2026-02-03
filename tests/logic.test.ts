@@ -104,7 +104,7 @@ test("truncateOutput leaves short text untouched", () => {
   assert.equal(result.text, text);
 });
 
-test("resolveLastTargetsFromStore falls back to latest external when last is webchat", () => {
+test("resolveLastTargetsFromStore replaces webchat last with latest external", () => {
   const store = {
     "agent:main:main": {
       updatedAt: 5,
@@ -123,9 +123,8 @@ test("resolveLastTargetsFromStore falls back to latest external when last is web
     store,
     sessionKey: "agent:main:main",
   });
-  assert.equal(targets.length, 2);
-  assert.equal(targets[0]?.channel, "webchat");
-  assert.equal(targets[1]?.channel, "telegram");
+  assert.equal(targets.length, 1);
+  assert.equal(targets[0]?.channel, "telegram");
 });
 
 test("resolveLastTargetsFromStore uses last external directly", () => {

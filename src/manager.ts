@@ -848,14 +848,14 @@ export function resolveLastTargetsFromStore(params: {
   if (!primary) {
     return [];
   }
-  const targets: ResolvedTarget[] = [toResolvedTarget(primary, "last")];
-  if (isInternalLastChannel(primary.channel)) {
-    const fallback = findLatestExternalTarget(params.store, primary);
-    if (fallback) {
-      targets.push(toResolvedTarget(fallback, "last-fallback"));
-    }
+  if (!isInternalLastChannel(primary.channel)) {
+    return [toResolvedTarget(primary, "last")];
   }
-  return targets;
+  const fallback = findLatestExternalTarget(params.store, primary);
+  if (fallback) {
+    return [toResolvedTarget(fallback, "last-fallback")];
+  }
+  return [toResolvedTarget(primary, "last")];
 }
 
 function hashOutput(output: string): string {
