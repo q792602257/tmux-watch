@@ -12,6 +12,7 @@ export type NotifyTarget = {
 
 export type TmuxWatchConfig = {
   enabled: boolean;
+  debug: boolean;
   captureIntervalSeconds?: number;
   pollIntervalMs?: number;
   stableCount?: number;
@@ -32,6 +33,7 @@ export const DEFAULT_STABLE_COUNT = 6;
 
 const DEFAULTS: Omit<TmuxWatchConfig, "captureIntervalSeconds" | "pollIntervalMs" | "stableCount" | "stableSeconds"> = {
   enabled: true,
+  debug: false,
   captureLines: 50,
   stripAnsi: true,
   maxOutputChars: 4000,
@@ -114,6 +116,7 @@ export function resolveTmuxWatchConfig(raw: unknown): TmuxWatchConfig {
 
   return {
     enabled: readBoolean(value.enabled, DEFAULTS.enabled),
+    debug: readBoolean(value.debug, DEFAULTS.debug),
     captureIntervalSeconds: readOptionalNumber(value.captureIntervalSeconds),
     pollIntervalMs: readOptionalNumber(value.pollIntervalMs),
     stableCount: readOptionalNumber(value.stableCount),

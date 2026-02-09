@@ -8,6 +8,7 @@
     "additionalProperties": false,
     "properties": {
       "enabled": { "type": "boolean", "default": true },
+      "debug": { "type": "boolean", "default": false },
       "captureIntervalSeconds": { "type": "number", "default": 10 },
       "stableCount": { "type": "number", "default": 6 },
       "pollIntervalMs": { "type": "number", "default": 10000 },

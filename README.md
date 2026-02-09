@@ -46,6 +46,7 @@ openclaw plugins install ./tmux-watch.tgz
       "tmux-watch": {
         "enabled": true,
         "config": {
+          "debug": false,
           "socket": "/private/tmp/tmux-501/default",
           "captureIntervalSeconds": 10,
           "stableCount": 6,
@@ -68,6 +69,7 @@ openclaw plugins install ./tmux-watch.tgz
 #### 配置项说明
 
 - `enabled`：是否启用插件（默认 `true`）。
+- `debug`：是否输出调试日志（默认 `false`）。开启后会记录轮询、稳定判定、目标解析、分发与发送结果。
 - `socket`：tmux socket 路径（必填）。
 - `captureIntervalSeconds`：每次捕获间隔（秒），默认 `10`。
 - `stableCount`：连续多少次捕获内容一致才触发告警，默认 `6`。总时长 = `captureIntervalSeconds × stableCount`（例如 `3 × 5 = 15s`）。
@@ -79,6 +81,14 @@ openclaw plugins install ./tmux-watch.tgz
 - `sessionKey`：覆盖默认 Agent 会话（通常不需要改）。
 - `notify.mode`：通知方式（`last` / `targets` / `targets+last`）。
 - `notify.targets`：通知目标数组（支持多个 channel，按数组顺序发送）。
+
+#### 调试日志
+
+将 `debug` 设为 `true` 并重启 Gateway 后，日志中会出现 `[tmux-watch][debug]` 前缀，重点包括：
+- 每个订阅的轮询启动/跳过/完成状态；
+- 稳定计数与触发 notify 的过程；
+- notify 目标解析、reply dispatch 结果；
+- 各 channel 的发送尝试、成功与失败。
 
 ### 快速配置（onboarding）
 
@@ -213,6 +223,7 @@ Edit `~/.openclaw/openclaw.json`:
       "tmux-watch": {
         "enabled": true,
         "config": {
+          "debug": false,
           "socket": "/private/tmp/tmux-501/default",
           "captureIntervalSeconds": 10,
           "stableCount": 6,
@@ -235,6 +246,7 @@ Edit `~/.openclaw/openclaw.json`:
 #### Configuration reference
 
 - `enabled`: Enable/disable the plugin (default `true`).
+- `debug`: Enable debug logs (default `false`). When enabled, watch polling, stability decisions, target resolution, dispatch, and send results are logged.
 - `socket`: tmux socket path (required).
 - `captureIntervalSeconds`: Capture interval in seconds (default `10`).
 - `stableCount`: Number of consecutive identical captures before alert (default `6`). Total duration = `captureIntervalSeconds × stableCount` (for example `3 × 5 = 15s`).
@@ -246,6 +258,14 @@ Edit `~/.openclaw/openclaw.json`:
 - `sessionKey`: Override the default agent session (rare).
 - `notify.mode`: Notification mode (`last` / `targets` / `targets+last`).
 - `notify.targets`: Notification targets (multiple channels supported, sent in order).
+
+#### Debug logs
+
+Set `debug` to `true` and restart the Gateway. Debug entries are prefixed with `[tmux-watch][debug]`, including:
+- per-subscription poll start/skip/complete events;
+- stability counter progression and notify triggers;
+- notify target resolution and reply dispatch outcomes;
+- channel send attempts, successes, and failures.
 
 #### Find the socket
 
