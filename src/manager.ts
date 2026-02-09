@@ -89,6 +89,7 @@ type MinimalConfig = {
 const STATE_VERSION = 1;
 const INTERNAL_LAST_CHANNELS = new Set(["webchat", "tui"]);
 const TMUX_RECHECK_INTERVAL_MS = 5000;
+const STATE_SYNC_INTERVAL_MS = 1000;
 
 export class TmuxWatchManager {
   private readonly api: OpenClawPluginApi;
@@ -101,6 +102,7 @@ export class TmuxWatchManager {
   private tmuxLastCheckedAt = 0;
   private stateMtimeMs = 0;
   private stateSyncPromise: Promise<void> | null = null;
+  private stateSyncTimer: NodeJS.Timeout | null = null;
 
   constructor(api: OpenClawPluginApi) {
     this.api = api;
@@ -115,7 +117,13 @@ export class TmuxWatchManager {
     this.stateDir = ctx.stateDir ?? null;
     this.active = true;
     await this.ensureLoaded();
+    this.startStateSyncLoop();
     await this.ensureTmuxAvailable({ force: true });
+    this.debugLog("manager started", {
+      statePath: this.getStatePath(),
+      subscriptions: this.entries.size,
+      tmuxAvailable: this.tmuxAvailable,
+    });
     for (const entry of this.entries.values()) {
       this.startWatch(entry);
     }
@@ -123,9 +131,35 @@ export class TmuxWatchManager {
 
   async stop(): Promise<void> {
     this.active = false;
+    this.stopStateSyncLoop();
+    this.debugLog("manager stopping", { subscriptions: this.entries.size });
     for (const entry of this.entries.values()) {
       this.stopWatchTimer(entry);
     }
+  }
+
+  private debugLog(message: string, details?: Record<string, unknown>): void {
+    if (!this.config.debug) {
+      return;
+    }
+    const suffix = details ? ` ${safeJson(details)}` : "";
+    this.api.logger.debug(`[tmux-watch][debug] ${message}${suffix}`);
+  }
+
+  private debugSubscription(
+    subscription: TmuxWatchSubscription,
+    message: string,
+    details?: Record<string, unknown>,
+  ): void {
+    if (!this.config.debug) {
+      return;
+    }
+    const context: Record<string, unknown> = {
+      id: subscription.id,
+      target: subscription.target,
+      label: subscription.label,
+    };
+    this.debugLog(message, details ? { ...context, ...details } : context);
   }
 
   async listSubscriptions(options?: { includeOutput?: boolean }) {
@@ -173,6 +207,9 @@ export class TmuxWatchManager {
     };
     const runtime = existing?.runtime ?? createRuntime();
     this.entries.set(id, { subscription, runtime });
+    this.debugSubscription(subscription, existing ? "subscription updated" : "subscription added", {
+      enabled: subscription.enabled !== false,
+    });
     await this.saveState();
     if (this.active && subscription.enabled !== false) {
       this.startWatch(this.entries.get(id)!);
@@ -186,10 +223,12 @@ export class TmuxWatchManager {
     await this.ensureLoaded();
     const entry = this.entries.get(id);
     if (!entry) {
+      this.debugLog("remove subscription skipped because id missing", { id });
       return false;
     }
     this.stopWatchTimer(entry);
     this.entries.delete(id);
+    this.debugSubscription(entry.subscription, "subscription removed");
     await this.saveState();
     return true;
   }
@@ -210,6 +249,11 @@ export class TmuxWatchManager {
     }
     this.stateMtimeMs = await this.readStateMtimeMs();
     this.loaded = true;
+    this.debugLog("state loaded", {
+      statePath: this.getStatePath(),
+      subscriptions: this.entries.size,
+      mtimeMs: this.stateMtimeMs,
+    });
   }
 
   private getStatePath(): string {
@@ -241,6 +285,11 @@ export class TmuxWatchManager {
     };
     await fs.writeFile(filePath, JSON.stringify(payload, null, 2));
     this.stateMtimeMs = await this.readStateMtimeMs();
+    this.debugLog("state saved", {
+      statePath: filePath,
+      subscriptions: payload.subscriptions.length,
+      mtimeMs: this.stateMtimeMs,
+    });
   }
 
   private async readStateMtimeMs(): Promise<number> {
@@ -286,6 +335,10 @@ export class TmuxWatchManager {
       if (mtimeMs === this.stateMtimeMs) {
         return;
       }
+      this.debugLog("state changed on disk; reconciling", {
+        previousMtimeMs: this.stateMtimeMs,
+        nextMtimeMs: mtimeMs,
+      });
       const state = await this.loadStateForSync();
       if (!state) {
         return;
@@ -299,6 +352,7 @@ export class TmuxWatchManager {
   }
 
   private reconcileEntriesFromState(state: PersistedState): void {
+    const previousSize = this.entries.size;
     const nextSubscriptions = new Map<string, TmuxWatchSubscription>();
     for (const subscription of state.subscriptions) {
       if (!subscription.id || !subscription.target) {
@@ -335,6 +389,10 @@ export class TmuxWatchManager {
         this.stopWatchTimer(existing);
       }
     }
+    this.debugLog("state reconciled", {
+      previousSubscriptions: previousSize,
+      nextSubscriptions: this.entries.size,
+    });
   }
 
   private isManagedEntry(entry: WatchEntry): boolean {
@@ -353,31 +411,73 @@ export class TmuxWatchManager {
     if (entry.runtime.timer) {
       clearInterval(entry.runtime.timer);
       entry.runtime.timer = undefined;
+      this.debugSubscription(entry.subscription, "watch timer stopped");
     }
+  }
+
+  private startStateSyncLoop(): void {
+    this.stopStateSyncLoop();
+    if (!this.active) {
+      return;
+    }
+    this.stateSyncTimer = setInterval(() => {
+      void this.syncStateFromDiskIfNeeded().catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.debugLog("state sync tick failed", { error: message });
+      });
+    }, STATE_SYNC_INTERVAL_MS);
+    this.stateSyncTimer.unref?.();
+    this.debugLog("state sync timer started", {
+      intervalMs: STATE_SYNC_INTERVAL_MS,
+    });
+  }
+
+  private stopStateSyncLoop(): void {
+    if (!this.stateSyncTimer) {
+      return;
+    }
+    clearInterval(this.stateSyncTimer);
+    this.stateSyncTimer = null;
+    this.debugLog("state sync timer stopped");
   }
 
   private startWatch(entry: WatchEntry): void {
     this.stopWatchTimer(entry);
     if (entry.subscription.enabled === false) {
+      this.debugSubscription(entry.subscription, "watch skipped because disabled");
       return;
     }
     const intervalMs = resolveIntervalMs(entry.subscription, this.config);
+    this.debugSubscription(entry.subscription, "watch timer started", {
+      intervalMs,
+      stableCount: resolveStableCount(entry.subscription, this.config),
+      notifyMode: resolveNotifyMode(entry.subscription, this.config),
+    });
     entry.runtime.timer = setInterval(() => {
       void (async () => {
         await this.syncStateFromDiskIfNeeded();
         await this.pollWatch(entry);
       })().catch((err) => {
         entry.runtime.lastError = err instanceof Error ? err.message : String(err);
+        this.debugSubscription(entry.subscription, "watch tick failed", {
+          error: entry.runtime.lastError,
+        });
       });
     }, intervalMs);
   }
 
   private async pollWatch(entry: WatchEntry): Promise<void> {
     if (!this.shouldWatchEntry(entry)) {
+      this.debugSubscription(entry.subscription, "poll skipped because entry is not watchable", {
+        active: this.active,
+        managed: this.isManagedEntry(entry),
+        enabled: entry.subscription.enabled !== false,
+      });
       this.stopWatchTimer(entry);
       return;
     }
     if (entry.runtime.running) {
+      this.debugSubscription(entry.subscription, "poll skipped because previous tick still running");
       return;
     }
     entry.runtime.running = true;
@@ -385,15 +485,18 @@ export class TmuxWatchManager {
       const output = await this.captureOutput(entry.subscription);
       if (output === null) {
         entry.runtime.stableTicks = 0;
+        this.debugSubscription(entry.subscription, "capture returned null; stableTicks reset");
         return;
       }
       if (!this.shouldWatchEntry(entry)) {
+        this.debugSubscription(entry.subscription, "poll aborted because entry became unwatchable");
         this.stopWatchTimer(entry);
         return;
       }
       entry.runtime.lastCapturedAt = Date.now();
       entry.runtime.lastError = undefined;
       const hash = hashOutput(output);
+      const previousHash = entry.runtime.lastHash;
       if (entry.runtime.lastHash && entry.runtime.lastHash === hash) {
         entry.runtime.stableTicks += 1;
       } else {
@@ -403,11 +506,26 @@ export class TmuxWatchManager {
         entry.runtime.lastNotifiedHash = undefined;
       }
       const stableTicks = resolveStableTicks(entry.subscription, this.config);
+      this.debugSubscription(entry.subscription, "poll captured", {
+        outputChars: output.length,
+        hash: hash.slice(0, 12),
+        previousHash: previousHash?.slice(0, 12),
+        stableTicks: entry.runtime.stableTicks,
+        stableTicksRequired: stableTicks,
+      });
       if (entry.runtime.stableTicks >= stableTicks) {
         if (entry.runtime.lastNotifiedHash !== hash) {
           entry.runtime.lastNotifiedHash = hash;
           entry.runtime.lastNotifiedAt = Date.now();
+          this.debugSubscription(entry.subscription, "stability reached; notifying", {
+            stableTicks: entry.runtime.stableTicks,
+            stableTicksRequired: stableTicks,
+          });
           await this.notifyStable(entry.subscription, output);
+        } else {
+          this.debugSubscription(entry.subscription, "stability reached but notify skipped", {
+            reason: "already notified for same hash",
+          });
         }
       }
     } finally {
@@ -419,11 +537,13 @@ export class TmuxWatchManager {
     if (!this.tmuxAvailable) {
       await this.ensureTmuxAvailable();
       if (!this.tmuxAvailable) {
+        this.debugSubscription(subscription, "capture skipped because tmux unavailable");
         return null;
       }
     }
     const target = subscription.target.trim();
     if (!target) {
+      this.debugSubscription(subscription, "capture skipped because target empty");
       return null;
     }
 
@@ -445,6 +565,10 @@ export class TmuxWatchManager {
         if (stderr) {
           this.api.logger.warn(`[tmux-watch] tmux error: ${stderr}`);
         }
+        this.debugSubscription(subscription, "capture command failed", {
+          exitCode: result.code,
+          stderr: stderr || "",
+        });
         return null;
       }
       let output = result.stdout ?? "";
@@ -452,10 +576,14 @@ export class TmuxWatchManager {
       if (resolveStripAnsi(subscription, this.config)) {
         output = stripAnsi(output);
       }
+      this.debugSubscription(subscription, "capture command succeeded", {
+        outputChars: output.length,
+      });
       return output;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.api.logger.warn(`[tmux-watch] tmux capture failed: ${message}`);
+      this.debugSubscription(subscription, "capture command threw", { error: message });
       return null;
     }
   }
@@ -464,19 +592,34 @@ export class TmuxWatchManager {
     subscription: TmuxWatchSubscription,
     output: string,
   ): Promise<void> {
+    this.debugSubscription(subscription, "notify pipeline started", {
+      outputChars: output.length,
+    });
     const sessionKey = normalizeSessionKey(
       subscription.sessionKey ?? this.config.sessionKey,
       this.api.config,
     );
     if (!sessionKey) {
       this.api.logger.warn("[tmux-watch] missing sessionKey; skipping notify");
+      this.debugSubscription(subscription, "notify skipped because sessionKey missing");
       return;
     }
     const targets = await this.resolveNotifyTargets(subscription, sessionKey);
     if (targets.length === 0) {
       this.api.logger.warn("[tmux-watch] no notify targets resolved; skipping notify");
+      this.debugSubscription(subscription, "notify skipped because no targets resolved", {
+        sessionKey,
+      });
       return;
     }
+    this.debugSubscription(subscription, "notify targets resolved", {
+      sessionKey,
+      targets: targets.map((target) => ({
+        channel: target.channel,
+        target: target.target,
+        source: target.source,
+      })),
+    });
     const primary = targets[0]!;
     const outputInfo = truncateOutput(output, this.config.maxOutputChars);
 
@@ -551,25 +694,42 @@ export class TmuxWatchManager {
 
     let dispatchedPrimary = false;
     try {
+      this.debugSubscription(subscription, "dispatching to reply pipeline", {
+        primaryChannel: primary.channel,
+        primaryTarget: primary.target,
+      });
       await this.api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
         ctx,
         cfg: this.api.config,
         dispatcherOptions: {
           deliver: async (payload: unknown, info: { kind: string }) => {
             if (info.kind !== "final") {
+              this.debugSubscription(subscription, "dispatcher ignored non-final payload", {
+                payloadKind: info.kind,
+              });
               return;
             }
             const text = extractReplyText(payload);
             if (!text) {
+              this.debugSubscription(subscription, "dispatcher final payload missing text");
               return;
             }
-            await this.sendToTarget(primary, text);
+            this.debugSubscription(subscription, "dispatcher produced final text", {
+              textChars: text.length,
+            });
+            await this.sendToTarget(primary, text, {
+              subscriptionId: subscription.id,
+              phase: "primary-dispatch",
+            });
             dispatchedPrimary = true;
           },
           onError: (err: unknown) => {
             this.api.logger.warn(
               `[tmux-watch] dispatch error: ${err instanceof Error ? err.message : String(err)}`,
             );
+            this.debugSubscription(subscription, "dispatch callback error", {
+              error: err instanceof Error ? err.message : String(err),
+            });
           },
         },
       });
@@ -577,27 +737,61 @@ export class TmuxWatchManager {
       this.api.logger.warn(
         `[tmux-watch] notify dispatch failed: ${err instanceof Error ? err.message : String(err)}`,
       );
+      this.debugSubscription(subscription, "notify dispatch threw", {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
 
     if (!dispatchedPrimary) {
-      await this.sendToTarget(primary, body);
+      this.debugSubscription(subscription, "dispatch produced no primary output; fallback to raw body");
+      await this.sendToTarget(primary, body, {
+        subscriptionId: subscription.id,
+        phase: "primary-fallback",
+      });
     }
 
     if (targets.length > 1) {
       const mirrorText = body;
       for (const target of targets.slice(1)) {
-        await this.sendToTarget(target, mirrorText);
+        await this.sendToTarget(target, mirrorText, {
+          subscriptionId: subscription.id,
+          phase: "mirror",
+        });
       }
     }
+    this.debugSubscription(subscription, "notify pipeline completed", {
+      dispatchedPrimary,
+      mirroredCount: Math.max(0, targets.length - 1),
+    });
   }
 
-  private async sendToTarget(target: ResolvedTarget, text: string): Promise<void> {
+  private async sendToTarget(
+    target: ResolvedTarget,
+    text: string,
+    context?: { subscriptionId?: string; phase?: string },
+  ): Promise<void> {
     const channel = target.channel.trim().toLowerCase();
     if (!channel || !text.trim()) {
+      this.debugLog("send skipped due to empty channel or text", {
+        channel: target.channel,
+        target: target.target,
+        subscriptionId: context?.subscriptionId,
+        phase: context?.phase,
+      });
       return;
     }
     const accountId = target.accountId?.trim() || undefined;
     const threadId = parseThreadId(target.threadId);
+    this.debugLog("send attempt", {
+      channel,
+      target: target.target,
+      accountId,
+      threadId,
+      source: target.source,
+      textChars: text.length,
+      subscriptionId: context?.subscriptionId,
+      phase: context?.phase,
+    });
 
     try {
       switch (channel) {
@@ -606,12 +800,24 @@ export class TmuxWatchManager {
             accountId,
             messageThreadId: threadId,
           });
+          this.debugLog("send success", {
+            channel,
+            target: target.target,
+            subscriptionId: context?.subscriptionId,
+            phase: context?.phase,
+          });
           return;
         }
         case "slack": {
           await this.api.runtime.channel.slack.sendMessage(target.target, text, {
             accountId,
             threadTs: threadId != null ? String(threadId) : undefined,
+          });
+          this.debugLog("send success", {
+            channel,
+            target: target.target,
+            subscriptionId: context?.subscriptionId,
+            phase: context?.phase,
           });
           return;
         }
@@ -620,11 +826,23 @@ export class TmuxWatchManager {
             accountId,
             replyTo: threadId != null ? String(threadId) : undefined,
           });
+          this.debugLog("send success", {
+            channel,
+            target: target.target,
+            subscriptionId: context?.subscriptionId,
+            phase: context?.phase,
+          });
           return;
         }
         case "signal": {
           await this.api.runtime.channel.signal.sendMessage(target.target, text, {
             accountId,
+          });
+          this.debugLog("send success", {
+            channel,
+            target: target.target,
+            subscriptionId: context?.subscriptionId,
+            phase: context?.phase,
           });
           return;
         }
@@ -632,11 +850,23 @@ export class TmuxWatchManager {
           await this.api.runtime.channel.imessage.sendMessage(target.target, text, {
             accountId,
           });
+          this.debugLog("send success", {
+            channel,
+            target: target.target,
+            subscriptionId: context?.subscriptionId,
+            phase: context?.phase,
+          });
           return;
         }
         case "line": {
           await this.api.runtime.channel.line.sendMessage(target.target, text, {
             accountId,
+          });
+          this.debugLog("send success", {
+            channel,
+            target: target.target,
+            subscriptionId: context?.subscriptionId,
+            phase: context?.phase,
           });
           return;
         }
@@ -647,10 +877,22 @@ export class TmuxWatchManager {
           await this.api.runtime.channel.whatsapp.sendMessage(target.target, text, {
             accountId,
           });
+          this.debugLog("send success", {
+            channel,
+            target: target.target,
+            subscriptionId: context?.subscriptionId,
+            phase: context?.phase,
+          });
           return;
         }
         default: {
           this.api.logger.warn(`[tmux-watch] unsupported notify channel: ${target.channel}`);
+          this.debugLog("send failed due to unsupported channel", {
+            channel: target.channel,
+            target: target.target,
+            subscriptionId: context?.subscriptionId,
+            phase: context?.phase,
+          });
           return;
         }
       }
@@ -660,6 +902,13 @@ export class TmuxWatchManager {
           err instanceof Error ? err.message : String(err)
         }`,
       );
+      this.debugLog("send threw", {
+        channel: target.channel,
+        target: target.target,
+        error: err instanceof Error ? err.message : String(err),
+        subscriptionId: context?.subscriptionId,
+        phase: context?.phase,
+      });
     }
   }
 
@@ -674,6 +923,9 @@ export class TmuxWatchManager {
 
     if (includeTargets) {
       const configured = resolveNotifyTargetList(subscription, this.config);
+      this.debugSubscription(subscription, "resolve notify targets from config", {
+        configuredCount: configured.length,
+      });
       for (const target of configured) {
         targets.push({
           channel: target.channel,
@@ -688,20 +940,40 @@ export class TmuxWatchManager {
 
     if (includeLast) {
       const lastTargets = await this.resolveLastTargets(sessionKey);
+      this.debugSubscription(subscription, "resolve notify targets from last session", {
+        lastCount: lastTargets.length,
+        sessionKey,
+      });
       if (lastTargets.length > 0) {
         targets.push(...lastTargets);
       }
     }
 
-    return dedupeTargets(targets);
+    const deduped = dedupeTargets(targets);
+    this.debugSubscription(subscription, "notify target dedupe completed", {
+      before: targets.length,
+      after: deduped.length,
+    });
+    return deduped;
   }
 
   private async resolveLastTargets(sessionKey: string): Promise<ResolvedTarget[]> {
     const store = await this.readSessionStore(sessionKey);
     if (!store) {
+      this.debugLog("resolve last targets skipped: session store unavailable", { sessionKey });
       return [];
     }
-    return resolveLastTargetsFromStore({ store, sessionKey });
+    const targets = resolveLastTargetsFromStore({ store, sessionKey });
+    this.debugLog("resolved last targets", {
+      sessionKey,
+      count: targets.length,
+      targets: targets.map((target) => ({
+        channel: target.channel,
+        target: target.target,
+        source: target.source,
+      })),
+    });
+    return targets;
   }
 
   private async readSessionStore(
@@ -716,12 +988,19 @@ export class TmuxWatchManager {
       const raw = await fs.readFile(storePath, "utf8");
       const store = JSON.parse(raw) as Record<string, SessionEntryLike>;
       if (!store || typeof store !== "object") {
+        this.debugLog("session store parsed to non-object", { sessionKey, storePath });
         return null;
       }
+      this.debugLog("session store loaded", {
+        sessionKey,
+        storePath,
+        entries: Object.keys(store).length,
+      });
       return store;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.api.logger.warn(`[tmux-watch] session store read failed: ${message}`);
+      this.debugLog("session store read failed", { sessionKey, storePath, error: message });
       return null;
     }
   }
@@ -737,6 +1016,12 @@ export class TmuxWatchManager {
         timeoutMs: 2000,
       });
       this.tmuxAvailable = res.code === 0;
+      this.debugLog("tmux availability checked", {
+        code: res.code,
+        stdout: (res.stdout ?? "").trim(),
+        stderr: (res.stderr ?? "").trim(),
+        tmuxAvailable: this.tmuxAvailable,
+      });
       if (!this.tmuxAvailable) {
         this.api.logger.warn("[tmux-watch] tmux not available (tmux -V failed)");
       }
@@ -745,6 +1030,9 @@ export class TmuxWatchManager {
       this.api.logger.warn(
         `[tmux-watch] tmux not available: ${err instanceof Error ? err.message : String(err)}`,
       );
+      this.debugLog("tmux availability check threw", {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 }
@@ -1108,6 +1396,14 @@ function parseThreadId(value: unknown): string | number | undefined {
     return Number.parseInt(trimmed, 10);
   }
   return trimmed;
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "\"[unserializable]\"";
+  }
 }
 
 export function extractReplyText(payload: unknown): string | undefined {
