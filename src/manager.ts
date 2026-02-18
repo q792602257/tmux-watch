@@ -112,6 +112,7 @@ export class TmuxWatchManager {
   private stateSyncPromise: Promise<void> | null = null;
   private stateSyncTimer: NodeJS.Timeout | null = null;
   private pollIdCounter = 0;
+  private runEpoch = 0;
 
   constructor(api: OpenClawPluginApi) {
     this.api = api;
@@ -123,6 +124,7 @@ export class TmuxWatchManager {
       this.api.logger.info("[tmux-watch] disabled via config");
       return;
     }
+    this.runEpoch += 1;
     this.stateDir = ctx.stateDir ?? null;
     this.active = true;
     await this.ensureLoaded();
@@ -139,11 +141,15 @@ export class TmuxWatchManager {
   }
 
   async stop(): Promise<void> {
+    this.runEpoch += 1;
     this.active = false;
     this.stopStateSyncLoop();
     this.debugLog("manager stopping", { subscriptions: this.entries.size });
     for (const entry of this.entries.values()) {
       this.stopWatchTimer(entry);
+      entry.runtime.runningPollId = undefined;
+      entry.runtime.runningStartedAt = undefined;
+      entry.runtime.notifyInFlight = undefined;
     }
   }
 
@@ -274,12 +280,18 @@ export class TmuxWatchManager {
     const filePath = this.getStatePath();
     try {
       const raw = await fs.readFile(filePath, "utf8");
-      const parsed = JSON.parse(raw) as PersistedState;
-      if (!parsed || parsed.version !== STATE_VERSION || !Array.isArray(parsed.subscriptions)) {
+      const parsed = this.parsePersistedState(raw, filePath);
+      if (parsed) {
+        return parsed;
+      }
+      return { version: STATE_VERSION, subscriptions: [] };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         return { version: STATE_VERSION, subscriptions: [] };
       }
-      return parsed;
-    } catch {
+      const message = err instanceof Error ? err.message : String(err);
+      this.api.logger.warn(`[tmux-watch] state file read failed (${filePath}): ${message}`);
+      this.debugLog("state read failed", { statePath: filePath, error: message });
       return { version: STATE_VERSION, subscriptions: [] };
     }
   }
@@ -292,7 +304,27 @@ export class TmuxWatchManager {
       version: STATE_VERSION,
       subscriptions: Array.from(this.entries.values()).map((entry) => entry.subscription),
     };
-    await fs.writeFile(filePath, JSON.stringify(payload, null, 2));
+    const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${randomUUID()}`;
+    const serialized = JSON.stringify(payload, null, 2);
+    let tempExists = false;
+    try {
+      const handle = await fs.open(tempPath, "w", 0o600);
+      tempExists = true;
+      try {
+        await handle.writeFile(serialized, "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await fs.rename(tempPath, filePath);
+      tempExists = false;
+      await this.fsyncDirectory(dir);
+    } catch (err) {
+      if (tempExists) {
+        await fs.rm(tempPath, { force: true }).catch(() => {});
+      }
+      throw err;
+    }
     this.stateMtimeMs = await this.readStateMtimeMs();
     this.debugLog("state saved", {
       statePath: filePath,
@@ -318,16 +350,63 @@ export class TmuxWatchManager {
     const filePath = this.getStatePath();
     try {
       const raw = await fs.readFile(filePath, "utf8");
-      const parsed = JSON.parse(raw) as PersistedState;
-      if (!parsed || parsed.version !== STATE_VERSION || !Array.isArray(parsed.subscriptions)) {
-        return { version: STATE_VERSION, subscriptions: [] };
-      }
-      return parsed;
+      return this.parsePersistedState(raw, filePath);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         return { version: STATE_VERSION, subscriptions: [] };
       }
+      const message = err instanceof Error ? err.message : String(err);
+      this.api.logger.warn(`[tmux-watch] state file sync read failed (${filePath}): ${message}`);
+      this.debugLog("state sync read failed", { statePath: filePath, error: message });
       return null;
+    }
+  }
+
+  private parsePersistedState(raw: string, filePath: string): PersistedState | null {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.api.logger.warn(`[tmux-watch] state file parse failed (${filePath}): ${message}`);
+      this.debugLog("state parse failed", { statePath: filePath, error: message });
+      return null;
+    }
+    if (!isRecord(parsed)) {
+      this.api.logger.warn(`[tmux-watch] state file invalid: root is not an object (${filePath})`);
+      this.debugLog("state parse invalid shape", { statePath: filePath, reason: "root-not-object" });
+      return null;
+    }
+    const version = parsed.version;
+    const subscriptions = parsed.subscriptions;
+    if (version !== STATE_VERSION || !Array.isArray(subscriptions)) {
+      this.api.logger.warn(`[tmux-watch] state file invalid schema (${filePath}); ignoring content`);
+      this.debugLog("state parse invalid schema", {
+        statePath: filePath,
+        version,
+        hasSubscriptionsArray: Array.isArray(subscriptions),
+      });
+      return null;
+    }
+    return {
+      version: STATE_VERSION,
+      subscriptions: subscriptions as TmuxWatchSubscription[],
+    };
+  }
+
+  private async fsyncDirectory(dirPath: string): Promise<void> {
+    try {
+      const handle = await fs.open(dirPath, "r");
+      try {
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+    } catch (err) {
+      this.debugLog("directory fsync skipped", {
+        dirPath,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -350,6 +429,7 @@ export class TmuxWatchManager {
       });
       const state = await this.loadStateForSync();
       if (!state) {
+        this.stateMtimeMs = mtimeMs;
         return;
       }
       this.stateMtimeMs = mtimeMs;
@@ -506,9 +586,13 @@ export class TmuxWatchManager {
       entry.runtime.runningStartedAt = undefined;
     }
     const pollId = ++this.pollIdCounter;
+    const runEpoch = this.runEpoch;
     entry.runtime.runningPollId = pollId;
     entry.runtime.runningStartedAt = Date.now();
-    const isStale = () => entry.runtime.runningPollId !== pollId;
+    const isStale = () =>
+      entry.runtime.runningPollId !== pollId ||
+      this.runEpoch !== runEpoch ||
+      !this.shouldWatchEntry(entry);
     const subscription = { ...entry.subscription };
     try {
       const output = await this.captureOutput(subscription);
@@ -1180,10 +1264,27 @@ export class TmuxWatchManager {
     );
     try {
       const raw = await fs.readFile(storePath, "utf8");
-      const store = JSON.parse(raw) as Record<string, SessionEntryLike>;
-      if (!store || typeof store !== "object") {
+      const parsed = JSON.parse(raw) as unknown;
+      if (!isRecord(parsed)) {
         this.debugLog("session store parsed to non-object", { sessionKey, storePath });
         return null;
+      }
+      const store: Record<string, SessionEntryLike> = {};
+      let skipped = 0;
+      for (const [key, value] of Object.entries(parsed)) {
+        if (!isRecord(value)) {
+          skipped += 1;
+          continue;
+        }
+        store[key] = value as SessionEntryLike;
+      }
+      if (skipped > 0) {
+        this.debugLog("session store contained invalid entries and was partially filtered", {
+          sessionKey,
+          storePath,
+          skipped,
+          kept: Object.keys(store).length,
+        });
       }
       this.debugLog("session store loaded", {
         sessionKey,
@@ -1328,7 +1429,7 @@ function resolveNotifyTargetList(
   cfg: TmuxWatchConfig,
 ): NotifyTarget[] {
   const targets = subscription.notify?.targets;
-  if (Array.isArray(targets) && targets.length > 0) {
+  if (Array.isArray(targets)) {
     return sanitizeTargets(targets);
   }
   return sanitizeTargets(cfg.notify.targets);
@@ -1519,7 +1620,10 @@ function findLatestExternalTarget(
   const excludeKey = snapshotKey(exclude);
   let best: { updatedAt: number; target: TargetSnapshot } | null = null;
   for (const entry of Object.values(store)) {
-    const snapshot = extractTargetSnapshot(entry);
+    if (!isRecord(entry)) {
+      continue;
+    }
+    const snapshot = extractTargetSnapshot(entry as SessionEntryLike);
     if (!snapshot) {
       continue;
     }
@@ -1555,14 +1659,14 @@ export function resolveLastTargetsFromStore(params: {
   store: Record<string, SessionEntryLike>;
   sessionKey: string;
 }): ResolvedTarget[] {
-  const entry =
+  const entryRaw =
     params.store[params.sessionKey] ??
     params.store[params.sessionKey.toLowerCase()] ??
     null;
-  if (!entry) {
+  if (!isRecord(entryRaw)) {
     return [];
   }
-  const primary = extractTargetSnapshot(entry);
+  const primary = extractTargetSnapshot(entryRaw as SessionEntryLike);
   if (!primary) {
     return [];
   }
@@ -1603,6 +1707,10 @@ function safeJson(value: unknown): string {
   } catch {
     return "\"[unserializable]\"";
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 export function extractReplyText(payload: unknown): string | undefined {

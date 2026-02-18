@@ -400,3 +400,260 @@ test("extractReplyText reads text from reply payload", () => {
   assert.equal(extractReplyText({ text: 123 }), undefined);
   assert.equal(extractReplyText(null), undefined);
 });
+
+test("stop invalidates in-flight notify before message send", async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "tmux-watch-stop-race-"));
+  let sendCount = 0;
+  let releaseDeliver: (() => void) | null = null;
+  const deliverGate = new Promise<void>((resolve) => {
+    releaseDeliver = resolve;
+  });
+
+  const api = {
+    pluginConfig: {
+      enabled: true,
+      debug: false,
+      captureIntervalSeconds: 60,
+      stableCount: 1,
+      notify: { mode: "targets", targets: [] },
+    },
+    config: {
+      session: { scope: "agent", mainKey: "main" },
+      agents: { list: [{ id: "main", default: true }] },
+    },
+    logger: {
+      debug: () => {},
+      info: () => {},
+      warn: () => {},
+      error: () => {},
+    },
+    runtime: {
+      state: {
+        resolveStateDir: () => stateDir,
+      },
+      system: {
+        runCommandWithTimeout: async (argv: string[]) => {
+          if (argv[0] === "tmux" && argv[1] === "-V") {
+            return { code: 0, stdout: "tmux 3.4", stderr: "" };
+          }
+          if (argv[0] === "tmux" && argv.includes("capture-pane")) {
+            return { code: 0, stdout: "stable output", stderr: "" };
+          }
+          return { code: 1, stdout: "", stderr: "unexpected command" };
+        },
+      },
+      channel: {
+        reply: {
+          dispatchReplyWithBufferedBlockDispatcher: async ({
+            dispatcherOptions,
+          }: {
+            dispatcherOptions: {
+              deliver: (payload: unknown, info: { kind: string }) => Promise<void> | void;
+            };
+          }) => {
+            await deliverGate;
+            await dispatcherOptions.deliver({ text: "summary" }, { kind: "final" });
+          },
+        },
+        telegram: {
+          sendMessage: async () => {
+            sendCount += 1;
+          },
+        },
+      },
+    },
+  } as unknown as OpenClawPluginApi;
+
+  const manager = createTmuxWatchManager(api) as unknown as {
+    start: (ctx: OpenClawPluginServiceContext) => Promise<void>;
+    stop: () => Promise<void>;
+    addSubscription: (
+      input: Partial<{
+        id: string;
+        target: string;
+        captureIntervalSeconds: number;
+        stableCount: number;
+        notify: { mode: "targets"; targets: Array<{ channel: string; target: string }> };
+      }> &
+        { target: string },
+    ) => Promise<void>;
+    pollWatch: (entry: unknown) => Promise<void>;
+    entries: Map<string, unknown>;
+  };
+
+  try {
+    await manager.start({ stateDir });
+    await manager.addSubscription({
+      id: "sub-stop-race",
+      target: "session:0.0",
+      captureIntervalSeconds: 60,
+      stableCount: 1,
+      notify: {
+        mode: "targets",
+        targets: [{ channel: "telegram", target: "123" }],
+      },
+    });
+    const entry = manager.entries.get("sub-stop-race");
+    assert.ok(entry);
+
+    await manager.pollWatch(entry);
+    const secondPoll = manager.pollWatch(entry);
+    await waitFor(async () => {
+      const runtime = (entry as { runtime?: { notifyInFlight?: unknown } }).runtime;
+      return Boolean(runtime?.notifyInFlight);
+    });
+
+    if (typeof releaseDeliver !== "function") {
+      assert.fail("releaseDeliver should be initialized");
+    }
+    await manager.stop();
+    (releaseDeliver as () => void)();
+    await secondPoll;
+
+    assert.equal(sendCount, 0);
+  } finally {
+    await manager.stop();
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("manager ignores malformed sync state instead of clearing in-memory subscriptions", async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "tmux-watch-state-invalid-"));
+  const api = {
+    pluginConfig: {
+      enabled: true,
+      debug: false,
+      captureIntervalSeconds: 60,
+      stableCount: 6,
+      notify: { mode: "targets", targets: [] },
+    },
+    config: {
+      session: { scope: "agent", mainKey: "main" },
+      agents: { list: [{ id: "main", default: true }] },
+    },
+    logger: {
+      debug: () => {},
+      info: () => {},
+      warn: () => {},
+      error: () => {},
+    },
+    runtime: {
+      state: {
+        resolveStateDir: () => stateDir,
+      },
+      system: {
+        runCommandWithTimeout: async (argv: string[]) => {
+          if (argv[0] === "tmux" && argv[1] === "-V") {
+            return { code: 0, stdout: "tmux 3.4", stderr: "" };
+          }
+          return { code: 1, stdout: "", stderr: "not implemented in test" };
+        },
+      },
+    },
+  } as unknown as OpenClawPluginApi;
+  const manager = createTmuxWatchManager(api);
+
+  try {
+    await manager.start({ stateDir });
+    await manager.addSubscription({
+      id: "keep-sub",
+      target: "session:0.0",
+      captureIntervalSeconds: 60,
+      enabled: true,
+    });
+
+    const statePath = path.join(stateDir, "tmux-watch", "subscriptions.json");
+    await fs.writeFile(statePath, JSON.stringify({ version: 1, subscriptions: {} }, null, 2));
+
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    const items = await manager.listSubscriptions({ includeOutput: false });
+    assert.equal(items.some((item) => item.id === "keep-sub"), true);
+  } finally {
+    await manager.stop();
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("subscription notify.targets=[] overrides global targets", async () => {
+  const api = {
+    pluginConfig: {
+      enabled: true,
+      debug: false,
+      notify: {
+        mode: "targets",
+        targets: [{ channel: "telegram", target: "global-target" }],
+      },
+    },
+    config: {
+      session: { scope: "agent", mainKey: "main" },
+      agents: { list: [{ id: "main", default: true }] },
+    },
+    logger: {
+      debug: () => {},
+      info: () => {},
+      warn: () => {},
+      error: () => {},
+    },
+    runtime: {
+      state: {
+        resolveStateDir: () => os.tmpdir(),
+      },
+      system: {
+        runCommandWithTimeout: async () => ({ code: 0, stdout: "", stderr: "" }),
+      },
+      channel: {
+        session: {
+          resolveStorePath: () => "",
+        },
+      },
+    },
+  } as unknown as OpenClawPluginApi;
+  const manager = createTmuxWatchManager(api) as unknown as {
+    resolveNotifyTargets: (
+      subscription: {
+        id: string;
+        target: string;
+        notify: { mode: "targets"; targets: Array<{ channel: string; target: string }> };
+      },
+      sessionKey: string,
+    ) => Promise<Array<{ channel: string; target: string }>>;
+  };
+
+  const targets = await manager.resolveNotifyTargets(
+    {
+      id: "sub-empty-targets",
+      target: "session:0.0",
+      notify: { mode: "targets", targets: [] },
+    },
+    "agent:main:main",
+  );
+  assert.equal(targets.length, 0);
+});
+
+test("resolveLastTargetsFromStore tolerates invalid session entry values", () => {
+  const store = {
+    "agent:main:main": {
+      updatedAt: 5,
+      deliveryContext: { channel: "webchat", to: "webchat:client" },
+    },
+    "agent:main:bad-null": null,
+    "agent:main:bad-string": "invalid",
+    "agent:main:telegram": {
+      updatedAt: 4,
+      deliveryContext: { channel: "telegram", to: "123" },
+    },
+  } as unknown as Record<string, unknown> as Record<string, { updatedAt?: number }>;
+
+  const targets = resolveLastTargetsFromStore({
+    store: store as unknown as Record<string, { updatedAt?: number }>,
+    sessionKey: "agent:main:main",
+  });
+  assert.equal(targets.length, 1);
+  assert.equal(targets[0]?.channel, "telegram");
+
+  const empty = resolveLastTargetsFromStore({
+    store: { "agent:main:main": null } as unknown as Record<string, { updatedAt?: number }>,
+    sessionKey: "agent:main:main",
+  });
+  assert.equal(empty.length, 0);
+});
